@@ -12,11 +12,36 @@
 #include <vector>
 #include <memory>
 
+int compare_entries_reverse(const void* a, const void* b)
+{
+    const uint64_t* a_key = static_cast<const uint64_t*>(a);
+    const uint64_t* b_key = static_cast<const uint64_t*>(b);
+
+    // Unrolled comparison of 4 uint64_t values (4 * 8 = 32 bytes)
+    if (b_key[0] > a_key[0]) return 1;
+    if (b_key[0] < a_key[0]) return -1;
+
+    if (b_key[1] > a_key[1]) return 1;
+    if (b_key[1] < a_key[1]) return -1;
+
+    if (b_key[2] > a_key[2]) return 1;
+    if (b_key[2] < a_key[2]) return -1;
+
+    if (b_key[3] > a_key[3]) return 1;
+    if (b_key[3] < a_key[3]) return -1;
+
+    return 0;  // Keys are equal
+}
+
+
 class SnugDB
 {
 
 private:
-    static constexpr uint64_t SNUGSIZE = 256ull*1024ull*1024ull*1024ull;
+    static constexpr uint64_t SNUGSIZE = 256ull*1024ull*1024ull*1024ull;        // 256 GiB
+    static constexpr uint64_t BIGSIZE = 10ull*1024ull*1024ull*1024ull*1024ull;  // 10 TiB
+
+
     static constexpr size_t BUCKET_COUNT = 1048576;
 
     std::unique_ptr<std::shared_mutex[]> mutexes = 
@@ -27,6 +52,11 @@ private:
     uint8_t* mapped_files[1024];
     uint64_t mapped_files_count { 0 };
 
+    uint8_t* big_file; // this file has 64kib blocks in it which are used 
+                       // as an overflow for large blobs
+
+    std::mutex big_file_mutex; // locked when incrementing the "next new block" pointer
+
     // only used when adding a new file
     std::mutex mapped_files_count_mutex;
 
@@ -36,7 +66,7 @@ private:
     // 1 = could not open
     // 2 = could not seek
     // 3 = could not write at end of file
-    int alloc_file(char const* fn)
+    int alloc_file(char const* fn, uint64_t size)
     {
         int fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0)
@@ -44,7 +74,7 @@ private:
 
         // must be a multiple of bufsize
 
-        if (lseek(fd, SNUGSIZE - 1, SEEK_SET) == -1)
+        if (lseek(fd, size, SEEK_SET) == -1)
         {
             close(fd);
             unlink(fn);
@@ -63,7 +93,7 @@ private:
     }
     
     // 0 = file exists and is right size
-    int check_file(char const* fn)
+    int check_file(char const* fn, uint64_t size)
     {
         struct stat st;
         int file_exists = (stat(fn, &st) == 0);
@@ -71,7 +101,7 @@ private:
         if (!file_exists)
             return 1;
 
-        if (st.st_size != SNUGSIZE)
+        if (st.st_size != size + 1)
             return 2;
 
         return 0;
@@ -105,6 +135,127 @@ private:
         *((uint64_t*)((x)+32)) = flags;\
     }
 
+    // if an entry exceeds 984 bytes then the overflow is written
+    // into the snug.big file in a linked list of 32kib blocks
+    // the first of those blocks is a control block
+    
+    uint64_t get_big_block()
+    {
+        std::unique_lock<std::mutex> lock(big_file_mutex);
+
+        uint64_t free_blocks = *((uint64_t*)(big_file + 8));
+        if (free_blocks == 0)
+        {
+            // no free blocks, allocate a new one
+            uint64_t next_block = *((uint64_t*)big_file);
+            *((uint64_t*)(big_file)) += 32768;
+
+            if (next_block + 32768 > BIGSIZE)
+                return 0;
+
+            return next_block;
+        }
+            
+        // grab the nth one
+        uint8_t* offset = big_file + 16 
+            + 8 * (free_blocks - 1);
+
+        // decrement free block counter
+        *(uint64_t*)(big_file + 8) -= 1;
+
+        return *((uint64_t*)offset);
+    }
+
+    void unalloc_blocks(uint64_t next_block)
+    {
+        if (next_block != 0)
+        {
+            // scope the lock only if called with non-zero nextblock
+            std::unique_lock<std::mutex> lock(big_file_mutex);
+            do
+            {
+                uint64_t free_blocks = *((uint64_t*)(big_file + 8));
+
+                if (free_blocks >= 4095)
+                    break;
+
+            
+                uint8_t* offset = big_file + 16 
+                    + 8 * free_blocks;
+
+                *((uint64_t*) offset) = next_block;
+
+                *((uint64_t*)(big_file + 8)) += 1;
+
+                uint8_t* big_ptr = big_file + next_block;
+                uint64_t previous = next_block;
+                next_block = *((uint64_t*)(big_file + next_block));
+
+                // clear the pointer on the old block
+                *((uint64_t*)(big_file + previous)) = 0;
+            }
+            while (next_block != 0);
+        }
+    }
+
+    /*
+     * First big entry is control block:
+     * 0 - 7: The next free new block
+     * 8 - 15: The number of free blocks blow
+     * 16 - 23 [... repeating]: The next free unused block
+     */
+    /*
+     * Big entry format:
+     * 0   -     7: next block in chain, if any.
+     * 8  - 32767: payload
+     */
+
+    // return 0 = failure
+    //        > 0 = first block in the chain
+    uint64_t write_big_entry_internal(uint8_t* data, ssize_t len, uint64_t next_block)
+    { 
+
+        uint64_t first_block = 0;
+
+        uint64_t* last_block_ptr = 0;
+        do
+        {
+            // if next_block is populated we follow an existing pathway
+            // otherwise allocate a new block now
+
+            if (!next_block)
+                next_block = get_big_block();
+
+            if (!next_block)
+                return 0;
+
+            if (!first_block)
+                first_block = next_block;
+
+            if (last_block_ptr)
+                *last_block_ptr = next_block;
+
+            uint8_t* big_ptr = big_file + next_block;
+
+            // copy to the block
+            ssize_t to_write = len > 32760 ? 32760 : len;
+            memcpy(big_ptr + 8, data, to_write);
+
+            data += to_write;
+            len -= to_write;
+        
+            next_block = *((uint64_t*)big_ptr);
+            last_block_ptr = (uint64_t*)big_ptr;
+        }
+        while (len > 0);
+       
+        // if there's a dangling chain we'll unallocate it 
+        if (next_block != 0)
+            unalloc_blocks(next_block);
+
+        return first_block;
+    }
+
     /*
      * Entry format:
      * 0    - 31: the 32 byte key
@@ -113,7 +264,8 @@ private:
      */
     // 0 = success
     // 1 = bucket full
-    int write_entry_internal(uint8_t* data, uint8_t* key, uint8_t* val, ssize_t len)
+    // 2 = big blocks full
+    int write_entry_internal(uint8_t* data, uint8_t* key, uint8_t* val, uint32_t len)
     {
         // find the entry
         uint64_t offset = OFFSET(key[0], key[1], (key[2]>>4));
@@ -127,11 +279,46 @@ private:
             if (!IS_ENTRY(start + i, key) && !IS_ZERO_ENTRY(start + i))
                 continue;    
 
-            /// write entry
 
-            // RH TODO: manage large val edge case
-            WRITE_KEY(start + i, key, (len & 0xFFFFFFFFUL));
-            memcpy(start + i + 40, val, len);
+            // read flags
+            uint64_t flags = *((uint64_t*)(start + i + 32));
+
+        
+            // big entries are tricky
+            bool const old_big = (flags >> 32) != 0;
+            bool const new_big = len > 984;
+
+            if (new_big)
+            {
+                //write_big_entry_internal(uint8_t* data, ssize_t len, uint64_t next_block)
+                uint64_t first_block = 
+                    write_big_entry_internal(val + 984, len - 984, (old_big ? (flags >> 32) : 0));
+
+                if (first_block == 0) // error state
+                {
+                    if (old_big)
+                        unalloc_blocks(flags >> 32);
+
+                    return 2;
+                }
+
+                flags = (first_block << 32) + len;
+            }
+            else if (old_big)   // big blocks exist but new value is small
+            {
+                // unallocate the old chain
+                unalloc_blocks(flags >> 32);
+            }
+            
+            if (!new_big)
+                flags = len;
+
+            /// write entry
+            WRITE_KEY(start + i, key, flags);
+            memcpy(start + i + 40, val, (len > 984 ? 984 : len));
+
+            // sort the bucket backwards so 0's appear at the end
+            qsort(start, 256, 1024, compare_entries_reverse);
 
             return 0;
         }
@@ -144,6 +331,8 @@ private:
     // with the length of the data found when returning
     int read_entry_internal(uint8_t* data, uint8_t* key, uint8_t* val_out, uint64_t* out_len)
     {
+        uint64_t buf_len = *out_len;
+
         // find the entry
         uint64_t offset = OFFSET(key[0], key[1], (key[2]>>4));
         uint8_t* start = data + offset;
@@ -160,16 +349,42 @@ private:
                 continue;
             
             // read out the value
-            // RH TODO: handle large val edge case
 
             uint64_t flags = *((uint64_t*)(start + i + 32));
+
             uint32_t size = flags & 0xFFFFFFFFUL;
+            uint64_t next_block = flags >> 32;
 
-            if (size > *out_len)
+            if (size > buf_len)
                 return 2;
-
-            memcpy(val_out, start + i + 40, size);
+            
             *out_len = size;
+
+            size_t to_read = size > 984 ? 984: size;
+            memcpy(val_out, start + i + 40, to_read);
+
+            val_out += to_read;
+            size -= to_read;
+
+            // big block read logic
+            while (size > 0)
+            {
+                // follow big block pointers
+                if (!next_block)
+                {
+                    printf("End while size=%d\n", size);
+                    return 3;
+                }
+
+                uint8_t* big_ptr = big_file + next_block;
+                to_read =  size > 32760 ? 32760 : size;
+                memcpy(val_out, big_ptr + 8, to_read);
+
+                val_out += to_read;
+                size -= to_read;
+
+                next_block = *((uint64_t*)big_ptr);
+            }
 
             return 0;
         }
@@ -207,7 +422,7 @@ private:
         if (snug_files.empty())
         {
             std::string new_file = path + "/snug.0";
-            int result = alloc_file(new_file.c_str());
+            int result = alloc_file(new_file.c_str(), SNUGSIZE);
             if (result != 0)
                 throw std::runtime_error("Failed to create initial file: " + new_file);
             snug_files.push_back("snug.0");
@@ -217,7 +432,7 @@ private:
         for (const auto& file : snug_files)
         {
             std::string full_path = path + "/" + file;
-            if (check_file(full_path.c_str()) != 0)
+            if (check_file(full_path.c_str(), SNUGSIZE) != 0)
                 throw std::runtime_error("File was the wrong size: " + file);
 
             int fd = open(full_path.c_str(), O_RDWR);
@@ -238,6 +453,36 @@ private:
                 throw std::runtime_error("Unable to mmap file: " + full_path);
 
             mapped_files[mapped_files_count++] = static_cast<uint8_t*>(mapped);
+        }
+
+        // create and map snug.big overflow file
+        {
+            std::string new_file = path + "/snug.big";
+            if (check_file(new_file.c_str(), BIGSIZE) != 0)
+            {
+                int result = alloc_file(new_file.c_str(), BIGSIZE);
+                if (result != 0)
+                    throw std::runtime_error("Failed to create initial file: " + new_file);
+            }
+
+            int fd = open(new_file.c_str(), O_RDWR);
+            if (fd == -1)
+                throw std::runtime_error("Unable to open file: " + new_file);
+
+            struct stat file_stat;
+            if (fstat(fd, &file_stat) == -1)
+            {
+                close(fd);
+                throw std::runtime_error("Unable to get file stats: " + new_file);
+            }
+
+            void* mapped = mmap(nullptr, file_stat.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            close(fd);  // Can close fd after mmap
+
+            if (mapped == MAP_FAILED)
+                throw std::runtime_error("Unable to mmap file: " + new_file);
+
+            big_file = static_cast<uint8_t*>(mapped);
         }
     }
 public:
@@ -264,17 +509,17 @@ public:
             if (result == 0)
                 return 0;
 
-            if (result != 1) // other error
+            if (result != 1) // only bucket full falls through
                 return result;
         }
 
+        // All existing files are full, allocate a new one
         {
             // acquire the mutex
             const std::lock_guard<std::mutex> lock(mapped_files_count_mutex);
 
-            // All existing files are full, allocate a new one
             std::string new_file = path + "/snug." + std::to_string(mapped_files_count);
-            int alloc_result = alloc_file(new_file.c_str());
+            int alloc_result = alloc_file(new_file.c_str(), SNUGSIZE);
             if (alloc_result != 0)
                 return alloc_result + 10;  // Return error code from alloc_file if it fails (+10)
 
@@ -307,23 +552,24 @@ public:
         return write_entry(key, val, len);
     }
 
-    int read_entry(uint8_t* key, uint8_t* val_out, uint64_t* out_len_ptr)
+    int read_entry(uint8_t* key, uint8_t* val_out, uint64_t* out_len_orig)
     {
-        uint64_t out_len = *out_len_ptr;
 
         for (size_t i = 0; i < mapped_files_count; ++i)
         {
-            int result = read_entry_internal(mapped_files[i], key, val_out, out_len_ptr);
+            uint64_t out_len = *out_len_orig;
+
+            int result =
+                read_entry_internal(mapped_files[i], key, val_out, &out_len);
             
             if (result == 0)
+            {
+                *out_len_orig = out_len;
                 return 0;  // Entry found and read successfully
+            }
             
             if (result == 2)
                 return 2;  // Output buffer too small
-            
-            // If result is 1 (entry not found in this file), continue to the next file
-            // Reset out_len for the next iteration
-            *out_len_ptr = out_len;
         }
         
         // Entry not found in any file
@@ -336,14 +582,28 @@ public:
 int main()
 {
     uint8_t key[]{
-            0xAB,0xAB,0xFF,0xAB,0xAB,0xAB,0xAB,0xAB,
-            0xAB,0xAB,0xAB,0xAB,0xAB,0xAB,0xAB,0xAB,
-            0xAB,0xAB,0xAB,0xAB,0xAB,0xAB,0xAB,0xAB,
-            0xAB,0xAB,0xAB,0xAB,0xAB,0xAB,0xAB,0xAB};
+        0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0};
 
     uint8_t val[] {0xDE, 0xAD, 0xBE, 0xEF, 0, 0};
+
+    uint8_t big_val[66*1024];
+
+    for (int i = 0; i < 66 * 1024; ++i)
+        big_val[i] = i % 256;
+
+
+//    printf("Bigval: ");
+//    for (uint64_t i = 0; i < sizeof(big_val); ++i)
+//        printf("%02X ", big_val[i]);
+
+//    printf("\n");
+
+
     SnugDB db(".");
-    /*
+    
     for (int i = 0; i < 257; ++i)
     {
         key[2] = i >> 8;
@@ -351,18 +611,20 @@ int main()
         val[4] = i >> 8;
         val[5] = i & 0xFF;
 
-        db.write_entry(key, val, 6);
+        if (i % 10 == 1)
+            db.write_entry(key, big_val, sizeof(big_val));
+        else
+            db.write_entry(key, val, sizeof(val));
     }
-    */
 
 
     for (int i = 0; i < 257; ++i)
     {
         key[2] = i >> 8;
         key[3] = i & 0xFF;
-        uint8_t buf[1024];
+        uint8_t buf[102400];
 
-        uint64_t len = 1024;
+        uint64_t len = sizeof(buf);
 
         printf("Read result: %d\n", db.read_entry(key, buf, &len));
         printf("Read len: %lu\n", len);
