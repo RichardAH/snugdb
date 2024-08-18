@@ -346,7 +346,7 @@ namespace snug
                 for (int i = 0; i < 256*1024; i+=1024)
                 {
                     if (IS_ZERO_ENTRY(start + i))
-                        return 0;
+                        return 1;
 
                     if (!IS_ENTRY(start + i, key))
                         continue;
@@ -582,7 +582,8 @@ namespace snug
             }
 
 
-            void visit_all(void (*f)(uint8_t*, uint8_t*, uint64_t))
+            void visit_all(void (*f)(uint8_t*, uint8_t*, uint64_t, void* /*opaque caller val*/),
+                    void* opaque)
             {
                 // to visit all we only need to check snug.0 to begin with
                 // we go to the first bucket
@@ -645,7 +646,7 @@ namespace snug
 
                         if (size <= 984)
                         {
-                            f(entry, entry + 40, size);
+                            f(entry, entry + 40, size, opaque);
                             continue;
                         }
 
@@ -679,7 +680,7 @@ namespace snug
                             next_block = *((uint64_t*)big_ptr);
                         }
 
-                        f(entry, data, (flags & 0xFFFFFFFFULL));
+                        f(entry, data, (flags & 0xFFFFFFFFULL), opaque);
                     }
                 }
 
