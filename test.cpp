@@ -43,7 +43,7 @@ int main()
             db.write_entry(key, val, sizeof(val));
     }
 
-
+/*
     for (int i = 0; i < 257; ++i)
     {
         key[2] = i >> 8;
@@ -60,6 +60,14 @@ int main()
 
         printf("\n");
 
-    }
+    }*/
+
+    db.visit_all([](uint8_t* key, uint8_t* data, uint64_t len, void* opq) -> void
+    {
+        printf("Visit key=");
+        for (int i = 0; i < 32; ++i)
+            printf("%02X", key[i]);
+        printf(", len=%lu\n", len);
+    }, 0);
     return 0;
 }
